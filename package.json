@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Whatsapp API for Seposale",
   "main": "index.js",
+  "type":"module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -14,7 +15,10 @@
   "license": "ISC",
   "dependencies": {
     "axios": "^1.7.9",
-    "dotenv": "^16.4.7",
     "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
+
 }
