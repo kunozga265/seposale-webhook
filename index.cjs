@@ -1,5 +1,6 @@
 /**
- * WhatsApp Webhook – Template-based Admin Forwarding
+ * WhatsApp Webhook – Cleaned, Sanitized, Media-Safe Version
+ * Supports: text, image, video, audio, document, sticker, contacts, location
  */
 
 const express = require("express");
@@ -12,7 +13,7 @@ app.use(express.json());
 const { WEBHOOK_VERIFY_TOKEN, GRAPH_API_TOKEN, PORT } = process.env;
 
 ///////////////////////////////////////////////////////////////////////////
-// 1. FACEBOOK API WRAPPER
+// 1. API WRAPPER
 ///////////////////////////////////////////////////////////////////////////
 const wapi = (phoneId, data) =>
   axios({
@@ -23,9 +24,38 @@ const wapi = (phoneId, data) =>
   });
 
 ///////////////////////////////////////////////////////////////////////////
-// 2. MEDIA DOWNLOAD + REUPLOAD
+// 2. SANITIZATION HELPERS
+///////////////////////////////////////////////////////////////////////////
+function sanitizeWhatsAppParam(text = "") {
+  return (text || "")
+    .toString()
+    .replace(/\t/g, " ")
+    .replace(/\n/g, " ")
+    .replace(/ {5,}/g, "    ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, ""); // zero-width chars
+}
+
+function sanitizeComponents(components = []) {
+  return components.map((comp) => {
+    if (!comp.parameters) return comp;
+
+    return {
+      ...comp,
+      parameters: comp.parameters.map((p) => {
+        if (p.type === "text" && p.text) {
+          return { ...p, text: sanitizeWhatsAppParam(p.text) };
+        }
+        return p;
+      }),
+    };
+  });
+}
+
+///////////////////////////////////////////////////////////////////////////
+// 3. MEDIA DOWNLOAD + REUPLOAD (MIME-SAFE)
 ///////////////////////////////////////////////////////////////////////////
 async function reuploadMedia(mediaId, phoneId) {
+  // metadata
   const info = await axios({
     url: `https://graph.facebook.com/v18.0/${mediaId}`,
     method: "GET",
@@ -33,7 +63,10 @@ async function reuploadMedia(mediaId, phoneId) {
   });
 
   const mediaUrl = info.data.url;
+  const mimeType = info.data.mime_type;
+  const fileExt = mimeType?.split("/")[1] || "bin";
 
+  // download
   const file = await axios({
     url: mediaUrl,
     method: "GET",
@@ -41,8 +74,12 @@ async function reuploadMedia(mediaId, phoneId) {
     headers: { Authorization: `Bearer ${GRAPH_API_TOKEN}` },
   });
 
+  // upload with correct MIME type
   const form = new FormData();
-  form.append("file", Buffer.from(file.data), { filename: "file" });
+  form.append("file", Buffer.from(file.data), {
+    filename: `file.${fileExt}`,
+    contentType: mimeType,
+  });
   form.append("messaging_product", "whatsapp");
 
   const upload = await axios({
@@ -59,24 +96,24 @@ async function reuploadMedia(mediaId, phoneId) {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// 3. FORWARD TO ADMIN — TEMPLATE MESSAGE
+// 4. FORWARD TO ADMIN (TEMPLATE-BASED)
 ///////////////////////////////////////////////////////////////////////////
-async function forwardToAdmin(phoneId, templateName, params = []) {
+async function forwardToAdmin(phoneId, templateName, components = []) {
   return wapi(phoneId, {
     messaging_product: "whatsapp",
     recipient_type: "individual",
-    to: "265888699977",
+    to: "265888699977", // admin number
     type: "template",
     template: {
       name: templateName,
       language: { code: "en" },
-      components: params,
+      components: sanitizeComponents(components),
     },
   });
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// 4. AUTO REPLY TO USER
+// 5. AUTO REPLY
 ///////////////////////////////////////////////////////////////////////////
 async function autoReply(phoneId, message) {
   return wapi(phoneId, {
@@ -92,7 +129,7 @@ async function autoReply(phoneId, message) {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// 5. MARK MESSAGE AS READ
+// 6. MARK MESSAGE AS READ
 ///////////////////////////////////////////////////////////////////////////
 async function markRead(phoneId, messageId) {
   return wapi(phoneId, {
@@ -103,176 +140,197 @@ async function markRead(phoneId, messageId) {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// 6. MAIN WEBHOOK HANDLER
+// 7. MARK MESSAGE AS READ
+///////////////////////////////////////////////////////////////////////////
+async function sendToServer(value) {
+  const webUrl = "https://sis.seposale.com/api/1.0.0/whatsapp/callback";
+
+  return axios.post(webUrl, { value });
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// 8. MAIN WEBHOOK HANDLER
 ///////////////////////////////////////////////////////////////////////////
 app.post("/webhook", async (req, res) => {
   console.log("Incoming:", JSON.stringify(req.body, null, 2));
+
+
+
 
   try {
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const message = change?.value?.messages?.[0];
 
+    await sendToServer(change.value).then((res)=> { 
+      console.log("API Response : " + res.status)
+      console.log(res.data)
+    })
+
     if (!message) return res.sendStatus(200);
 
     const phoneId = change.value.metadata.phone_number_id;
 
-    switch (message.type) {
-
-      //////////////////////////////////////////////////////////////////////
-      // TEXT MESSAGE
-      //////////////////////////////////////////////////////////////////////
-      case "text":
-        await forwardToAdmin(phoneId, "forwarded_response", [
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: message.from },
-              { type: "text", text: message.text.body },
-            ],
-          },
-        ]);
-        break;
-
-      //////////////////////////////////////////////////////////////////////
-      // IMAGE
-      //////////////////////////////////////////////////////////////////////
-      case "image": {
-        const newId = await reuploadMedia(message.image.id, phoneId);
-        await forwardToAdmin(phoneId, "forwarded_image", [
-          {
-            type: "header",
-            parameters: [
-              { type: "image", image: { id: newId } }
-            ],
-          },
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: message.from },
-              { type: "text", text: message.image.caption || "" },
-            ],
-          },
-        ]);
-        break;
-      }
-
-      //////////////////////////////////////////////////////////////////////
-      // VIDEO
-      //////////////////////////////////////////////////////////////////////
-      case "video": {
-        const newId = await reuploadMedia(message.video.id, phoneId);
-        await forwardToAdmin(phoneId, "forwarded_video", [
-          {
-            type: "header",
-            parameters: [{ type: "video", video: { id: newId } }],
-          },
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: message.from },
-              { type: "text", text: message.video.caption || "" },
-            ],
-          },
-        ]);
-        break;
-      }
-
-      //////////////////////////////////////////////////////////////////////
-      // AUDIO
-      //////////////////////////////////////////////////////////////////////
-      case "audio": {
-        const newId = await reuploadMedia(message.audio.id, phoneId);
-        await forwardToAdmin(phoneId, "forwarded_document", [
-          {
-            type: "header",
-            parameters: [{ type: "audio", audio: { id: newId } }],
-          },
-          {
-            type: "body",
-            parameters: [{ type: "text", text: message.from }],
-          },
-        ]);
-        break;
-      }
-
-      //////////////////////////////////////////////////////////////////////
-      // DOCUMENT
-      //////////////////////////////////////////////////////////////////////
-      case "document": {
-        const newId = await reuploadMedia(message.document.id, phoneId);
-        await forwardToAdmin(phoneId, "forwarded_document", [
-          {
-            type: "header",
-            parameters: [{ type: "document", document: { id: newId } }],
-          },
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: message.from },
-              { type: "text", text: message.document.filename },
-            ],
-          },
-        ]);
-        break;
-      }
-
-      //////////////////////////////////////////////////////////////////////
-      // STICKER
-      //////////////////////////////////////////////////////////////////////
-      case "sticker": {
-        const newId = await reuploadMedia(message.sticker.id, phoneId);
-        await forwardToAdmin(phoneId, "forwarded_image", [
-          {
-            type: "header",
-            parameters: [{ type: "image", image: { id: newId } }],
-          },
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: message.from },
-              { type: "text", text: "Sticker received" },
-            ],
-          },
-        ]);
-        break;
-      }
-
-      //////////////////////////////////////////////////////////////////////
-      // CONTACTS
-      //////////////////////////////////////////////////////////////////////
-      case "contacts":
-        await forwardToAdmin(phoneId, "forwarded_contacts", [
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: message.from },
-              { type: "text", text: JSON.stringify(message.contacts, null, 2) },
-            ],
-          },
-        ]);
-        break;
-
-      //////////////////////////////////////////////////////////////////////
-      // LOCATION
-      //////////////////////////////////////////////////////////////////////
-      case "location":
-        await forwardToAdmin(phoneId, "forwarded_location", [
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: message.from },
-              { type: "text", text: `${message.location.latitude}` },
-              { type: "text", text: `${message.location.longitude}` },
-            ],
-          },
-        ]);
-        break;
-
-      default:
-        console.log("Unhandled:", message.type);
+    ///////////////////////////////////////////////////////////////////////
+    // TEXT
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "text") {
+      await forwardToAdmin(phoneId, "forwarded_response", [
+        {
+          type: "body",
+          parameters: [
+            { type: "text", text: message.from },
+            { type: "text", text: message.text.body },
+          ],
+        },
+      ]);
     }
 
+    ///////////////////////////////////////////////////////////////////////
+    // IMAGE
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "image") {
+      const newId = await reuploadMedia(message.image.id, phoneId);
+
+      await forwardToAdmin(phoneId, "forwarded_image", [
+        {
+          type: "header",
+          parameters: [{ type: "image", image: { id: newId } }],
+        },
+        {
+          type: "body",
+          parameters: [
+            { type: "text", text: message.from },
+            { type: "text", text: message.image.caption || "" },
+          ],
+        },
+      ]);
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    // VIDEO
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "video") {
+      const newId = await reuploadMedia(message.video.id, phoneId);
+
+      await forwardToAdmin(phoneId, "forwarded_video", [
+        {
+          type: "header",
+          parameters: [{ type: "video", video: { id: newId } }],
+        },
+        {
+          type: "body",
+          parameters: [
+            { type: "text", text: message.from },
+            { type: "text", text: message.video.caption || "" },
+          ],
+        },
+      ]);
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    // AUDIO
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "audio") {
+      const newId = await reuploadMedia(message.audio.id, phoneId);
+
+      await forwardToAdmin(phoneId, "forwarded_document", [
+        {
+          type: "header",
+          parameters: [ { type: "document", document: { id: newId, filename: newId } },],
+        },
+        {
+          type: "body",
+          parameters: [{ type: "text", text: message.from },
+            { type: "text", text: "Uploaded Audio File:" + newId },
+
+          ],
+        },
+      ]);
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    // DOCUMENT
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "document") {
+      const newId = await reuploadMedia(message.document.id, phoneId);
+
+      await forwardToAdmin(phoneId, "forwarded_document", [
+        {
+          type: "header",
+          parameters: [
+            // { type: "document", document: { id: newId, filename: message.document.filename } },
+            { type: "document", document: { id: newId, filename: newId } },
+          ],
+        },
+        {
+          type: "body",
+          parameters: [
+            { type: "text", text: message.from },
+            { type: "text", text: "Uploaded File:" + message.document.filename },
+          ],
+        },
+      ]);
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    // STICKER
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "sticker") {
+      const newId = await reuploadMedia(message.sticker.id, phoneId);
+
+      await forwardToAdmin(phoneId, "forwarded_sticker", [
+        {
+          type: "header",
+          parameters: [{ type: "image", image: { id: newId } }],
+        },
+        {
+          type: "body",
+          parameters: [{ type: "text", text: message.from }],
+        },
+      ]);
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    // CONTACTS
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "contacts") {
+      await forwardToAdmin(phoneId, "forwarded_contacts", [
+        {
+          type: "body",
+          parameters: [
+            { type: "text", text: message.from },
+            {
+              type: "text",
+              text: JSON.stringify(message.contacts),
+            },
+          ],
+        },
+      ]);
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    // LOCATION
+    ///////////////////////////////////////////////////////////////////////
+    if (message.type === "location") {
+      await forwardToAdmin(phoneId, "forwarded_location", [
+        {
+          type: "body",
+          parameters: [
+            { type: "text", text: message.from },
+            {
+              type: "text",
+              text: `${message.location.latitude}, ${message.location.longitude}`,
+            },
+          ],
+        },
+      ]);
+    }
+
+    ///////////////////////////////////////////////////////////////////////
+    // AUTO REPLY + MARK READ
+    ///////////////////////////////////////////////////////////////////////
     await autoReply(phoneId, message);
     await markRead(phoneId, message.id);
 
@@ -284,7 +342,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 ///////////////////////////////////////////////////////////////////////////
-// 7. VERIFY WEBHOOK
+// 8. WEBHOOK VERIFICATION
 ///////////////////////////////////////////////////////////////////////////
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -292,7 +350,6 @@ app.get("/webhook", (req, res) => {
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === WEBHOOK_VERIFY_TOKEN) {
-    console.log("Webhook verified!");
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
@@ -300,15 +357,15 @@ app.get("/webhook", (req, res) => {
 });
 
 ///////////////////////////////////////////////////////////////////////////
-// 8. TEST ROUTE
+// 9. TEST ENDPOINT
 ///////////////////////////////////////////////////////////////////////////
 app.get("/", (req, res) => {
   res.send("WhatsApp Webhook Running");
 });
 
 ///////////////////////////////////////////////////////////////////////////
-// 9. START SERVER
+// 10. START SERVER
 ///////////////////////////////////////////////////////////////////////////
 app.listen(PORT || 3001, () => {
-  console.log(`Server running on ${PORT || 3001}`);
+  console.log(`Webhook running on port ${PORT || 3001}`);
 });
