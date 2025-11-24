@@ -8,6 +8,20 @@ const axios = require("axios");
 const FormData = require("form-data");
 
 const app = express();
+
+const cors = require("cors");
+
+// Allow Vue local dev (and your production domain)
+app.use(cors({
+  origin: [
+    "http://localhost:8000",      // Laravel + Vue dev server
+    "https://sis.seposale.com",   // Production domain
+    // "https://your-vue-domain.com" // optional
+  ],
+  methods: "GET,POST,OPTIONS",
+  allowedHeaders: "Content-Type, Authorization"
+}));
+
 app.use(express.json());
 
 const { WEBHOOK_VERIFY_TOKEN, GRAPH_API_TOKEN, PORT } = process.env;
@@ -163,7 +177,7 @@ app.post("/webhook", async (req, res) => {
     const change = entry?.changes?.[0];
     const message = change?.value?.messages?.[0];
 
-    await sendToServer(change.value).then((res)=> { 
+    await sendToServer(change.value).then((res) => {
       console.log("API Response : " + res.status)
       console.log(res.data)
     })
@@ -202,7 +216,7 @@ app.post("/webhook", async (req, res) => {
           type: "body",
           parameters: [
             { type: "text", text: message.from },
-            { type: "text", text: message.image.caption || "" },
+            { type: "text", text: "Attached caption: " + message.image?.caption },
           ],
         },
       ]);
@@ -223,7 +237,7 @@ app.post("/webhook", async (req, res) => {
           type: "body",
           parameters: [
             { type: "text", text: message.from },
-            { type: "text", text: message.video.caption || "" },
+            { type: "text", text: "Attached caption: " + message.video?.caption },
           ],
         },
       ]);
@@ -238,12 +252,12 @@ app.post("/webhook", async (req, res) => {
       await forwardToAdmin(phoneId, "forwarded_document", [
         {
           type: "header",
-          parameters: [ { type: "document", document: { id: newId, filename: newId } },],
+          parameters: [{ type: "document", document: { id: newId, filename: newId } },],
         },
         {
           type: "body",
           parameters: [{ type: "text", text: message.from },
-            { type: "text", text: "Uploaded Audio File:" + newId },
+          { type: "text", text: "Uploaded Audio File:" + newId },
 
           ],
         },
@@ -268,7 +282,7 @@ app.post("/webhook", async (req, res) => {
           type: "body",
           parameters: [
             { type: "text", text: message.from },
-            { type: "text", text: "Uploaded File:" + message.document.filename },
+            { type: "text", text: "Uploaded File :" + message.document?.filename },
           ],
         },
       ]);
@@ -316,12 +330,26 @@ app.post("/webhook", async (req, res) => {
     if (message.type === "location") {
       await forwardToAdmin(phoneId, "forwarded_location", [
         {
+          type: "header",
+          parameters: [
+            {
+              type: "location",
+              location: {
+                latitude: message.location.latitude,
+                longitude: message.location.longitude,
+                name: message.location.name,
+                address: message.location.address
+              }
+            }
+          ]
+        },
+        {
           type: "body",
           parameters: [
             { type: "text", text: message.from },
             {
               type: "text",
-              text: `${message.location.latitude}, ${message.location.longitude}`,
+              text: `${message.location?.latitude}, ${message.location?.longitude}`,
             },
           ],
         },
@@ -369,3 +397,40 @@ app.get("/", (req, res) => {
 app.listen(PORT || 3001, () => {
   console.log(`Webhook running on port ${PORT || 3001}`);
 });
+
+///////////////////////////////////////////////////////////////////////////
+// 11. PUBLIC MEDIA FETCH ENDPOINT (VUE WILL CALL THIS)
+///////////////////////////////////////////////////////////////////////////
+app.get("/media/:id", async (req, res) => {
+  try {
+    const mediaId = req.params.id;
+
+    // Step 1: Get media metadata
+    const metaRes = await axios({
+      url: `https://graph.facebook.com/v18.0/${mediaId}`,
+      method: "GET",
+      headers: { Authorization: `Bearer ${GRAPH_API_TOKEN}` },
+    });
+
+    const meta = metaRes.data;
+
+    // Step 2: Fetch actual binary media
+    const mediaRes = await axios({
+      url: meta.url,
+      method: "GET",
+      responseType: "arraybuffer",
+      headers: { Authorization: `Bearer ${GRAPH_API_TOKEN}` },
+    });
+
+    const mime = meta.mime_type || "application/octet-stream";
+
+    // Send blob directly to the browser
+    res.setHeader("Content-Type", mime);
+    res.send(Buffer.from(mediaRes.data));
+
+  } catch (error) {
+    console.error("MEDIA FETCH ERROR:", error.response?.data || error);
+    return res.status(500).json({ error: "Failed to fetch media" });
+  }
+});
+
